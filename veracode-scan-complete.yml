@@ -1,0 +1,183 @@
+trigger: none
+
+parameters:
+  - name: ENVVG
+    displayName: Select Environment To Deploy
+    type: string
+    default: UAT
+    values:
+    - DEV
+    - UAT
+    - PROD
+
+variables:
+- name: build_agent_pool
+  value: windows-latest
+
+- name: env
+  ${{ if eq(parameters.ENVVG, 'UAT') }}:
+    value: pwcqa
+  ${{ if eq(parameters.ENVVG, 'PROD') }}:
+    value: prod
+
+- name: frontend_working_dir
+  value: $(System.DefaultWorkingDirectory)\DAM_Artifact\UI
+
+- name: backend_working_dir
+  value: $(System.DefaultWorkingDirectory)\DAM_Artifact\API
+
+- name: BuildConfiguration
+  value: Release
+
+- name: DB_HOST
+  value: $(${{ parameters.ENVVG }}_DB_HOST)
+- name: DB_USERNAME
+  value: $(${{ parameters.ENVVG }}_DB_USERNAME)
+- name: DB_PASSWORD
+  value: $(${{ parameters.ENVVG }}_DB_PASSWORD)
+- name: DB_NAME
+  value: $(${{ parameters.ENVVG }}_DB_NAME)
+- name: BACKEND_URL
+  value: $(${{ parameters.ENVVG }}_BACKEND_URL) 
+- name: SOLR_URL
+  value: $(${{ parameters.ENVVG }}_SOLR_URL)
+
+- group: dams_platform
+
+stages:
+  - stage: BuildFE
+    displayName: 'Build FE'
+    pool: 
+      vmImage: $(build_agent_pool)
+
+    jobs:
+      - job: Build
+        displayName: "Build UI"
+        workspace:
+          clean: all
+        steps:
+
+          - checkout: self
+
+
+          - task: qetza.replacetokens.replacetokens-task.replacetokens@3
+            displayName: 'Replace Tokens in Manifests'
+            inputs:
+              rootDirectory: '$(Build.SourcesDirectory)'
+              targetFiles: '**.env'
+              escapeType: none
+              verbosity: detailed
+
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '16.x'
+            displayName: 'Install Node.js'
+
+          - script: npm install
+            displayName: 'npm install'
+
+          - script: npm run build
+            displayName: 'npm build'
+            
+          - script: cp $(Build.SourcesDirectory)/package-lock.json $(Build.SourcesDirectory)/build && cp $(Build.SourcesDirectory)/package.json $(Build.SourcesDirectory)/build
+            displayName: 'Copy package/package-lock.json to build folder'
+          
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Build.SourcesDirectory)/build
+              artifactName: DAM_Veracode_UI
+            displayName: "FE: Publish pipeline artifact"
+
+  - stage: BuildBE
+    displayName: 'Build BE'
+    pool: 
+      vmImage: $(build_agent_pool)
+    jobs:
+      - job: BuildBE
+        displayName: "Build BE"
+        workspace:
+          clean: all
+        steps:
+
+          - checkout: git://DAMs_PLATFORM/DAMs_PLATFORM_BACKEND
+
+ 
+          - task: qetza.replacetokens.replacetokens-task.replacetokens@3
+            displayName: 'Replace Tokens in Manifests'
+            inputs:
+              rootDirectory: '$(Build.SourcesDirectory)/src/main/resources/'
+              targetFiles: 'table.properties, database.properties, solrDocUrl.properties'
+              escapeType: none
+              verbosity: detailed
+
+          - script: mvn clean install
+            displayName: 'building java app'
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Build.SourcesDirectory)/target/sampleData-0.1.jar
+              artifactName: DAM_Veracode_API
+            displayName: "BE: Publish pipeline artifact"
+
+  - stage: Deploy
+    dependsOn:
+    - BuildFE
+    - BuildBE
+    displayName: "Initiate Veracode Scan"
+    pool: 
+      vmImage: $(build_agent_pool)
+    jobs:
+    - job: 
+      displayName: "Initiate Veracode Scan"
+      workspace:
+        clean: all
+      steps:
+        - task: DownloadPipelineArtifact@2
+          displayName: "Download FE Artifact"
+          inputs:
+            artifact: DAM_Veracode_UI
+            path: $(frontend_working_dir)
+
+        - task: DownloadPipelineArtifact@2
+          displayName: "Download BE Artifact"
+          inputs:
+            artifact: DAM_Veracode_API
+            path: $(backend_working_dir)
+
+        - script: |
+            echo "$(frontend_working_dir)"
+            ls $(frontend_working_dir)
+            echo "$(backend_working_dir)"
+            ls $(backend_working_dir)
+            mkdir -p $(System.DefaultWorkingDirectory)\DAM\UI
+            mkdir $(System.DefaultWorkingDirectory)\DAM\API
+            cp -r $(frontend_working_dir) $(System.DefaultWorkingDirectory)\DAM\UI\
+            cp -r $(backend_working_dir) $(System.DefaultWorkingDirectory)\DAM\API\
+          displayName: "Set up folder structure for veracode"
+
+        - task: ArchiveFiles@2
+          inputs:
+            rootFolderOrFile: '$(System.DefaultWorkingDirectory)\DAM'
+            archiveType: 'zip'
+            archiveFile: 'DAM_Veracode_$(Build.BuildId).zip' 
+
+        - task: PublishPipelineArtifact@1
+          inputs:
+            targetPath: $(System.DefaultWorkingDirectory)/DAM_Veracode_$(Build.BuildId).zip
+            artifactName: DAM_Veracode
+          displayName: "Publish veracode artifact"
+        
+        - task: Veracode.veracode-vsts-build-extension.veracode-scanner-task.Veracode@3
+          displayName: "Submit Veracode Sandbox Scan"
+          inputs:
+            AnalysisService: 'veracode_service_connection'
+            veracodeAppProfile: 'IND-ASR-DAMs_PLATFORM'
+            version: $(build.buildNumber)          
+            filepath: '$(System.DefaultWorkingDirectory)/DAM_Veracode_$(Build.BuildId).zip'
+            createSandBox: false
+            createProfile: false
+            failTheBuildIfVeracodeScanDidNotInitiate: false
+            scanStatusCheckInterval: '60'
+            importResults: false
+            failBuildOnPolicyFail: false
+        
